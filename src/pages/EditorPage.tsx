@@ -4,14 +4,17 @@ import type React from "react"
 import { useEffect, useRef, useState, useCallback } from "react"
 import { Link } from "react-router-dom"
 import { Button } from "@/components/ui/button"
-import { Home, Settings, Save, Upload, Download } from "lucide-react"
+import { Home, Settings, Save, Upload, Download, Music } from "lucide-react"
 import { useTheme } from "@/hooks/use-theme"
 import { useI18n } from "@/lib/i18n/context"
 import * as THREE from "three"
 import * as ADOFAI from "adofai"
 import Hjson from "hjson"
 import createTrackMesh from "@/lib/Geo/mesh_reserve"
+import { Player } from "@/lib/Player/Player"
+import { ILevelData } from "@/lib/Player/types"
 import example from "@/lib/example/line.json"
+import { useAppSettings } from "@/hooks/use-app-settings"
 import type { JSX } from "react/jsx-runtime"
 
 // 声明全局类型
@@ -63,6 +66,7 @@ function NotificationSystem(): JSX.Element {
   )
 }
 
+// @deprecated - Refactored to src/lib/Player/Player.ts
 class Previewer {
   private container: HTMLElement
   private fpsCounter: HTMLElement
@@ -849,7 +853,8 @@ class Previewer {
       } else {
         // 计算层级（第一个砖块层级12，后续递减）
         const zLevel = 12 - Number.parseInt(id)
-        const materialIndex = Number.parseInt(id) % this.tileMaterials!.length
+        // 修正纹理索引：使用0-based索引 (id - 1)
+        const materialIndex = (Number.parseInt(id) - 1) % this.tileMaterials!.length
 
         let pred = (this.adofaiFile.tiles[Number.parseInt(id) - 1]?.direction || 0) - 180
         if (this.adofaiFile.tiles[Number.parseInt(id) - 1]?.direction == 999) {
@@ -870,7 +875,7 @@ class Previewer {
         mesh.computeVertexNormals();
 
         tileMesh = new THREE.Mesh(mesh, this.tileMaterials![materialIndex])
-        tileMesh.position.set(x + 1, y, zLevel * 0.01) // 向右偏移1个单位，微小的z差异来实现层级
+        tileMesh.position.set(x, y, zLevel * 0.01) // 移除 +1 偏移，使用正确的位置
         tileMesh.castShadow = true
         tileMesh.receiveShadow = true
 
@@ -953,7 +958,8 @@ export default function EditorPage(): JSX.Element {
   const fpsCounterRef = useRef<HTMLDivElement>(null)
   const infoRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const previewerRef = useRef<Previewer | null>(null)
+  const audioInputRef = useRef<HTMLInputElement>(null)
+  const previewerRef = useRef<Player | null>(null)
   const [isLoading, setIsLoading] = useState<boolean>(false)
   const [adofaiFile, setAdofaiFile] = useState<any>(null)
   const [mounted, setMounted] = useState(false)
@@ -962,6 +968,7 @@ export default function EditorPage(): JSX.Element {
   const [playModeActive, setPlayModeActive] = useState(false)
   const { theme, resolvedTheme } = useTheme()
   const { t, mounted: i18nMounted } = useI18n()
+  const { settings } = useAppSettings()
 
   // 播放功能
   const handlePlay = useCallback((): void => {
@@ -1061,22 +1068,36 @@ export default function EditorPage(): JSX.Element {
             loadedLevel.calculateTilePosition()
             setAdofaiFile(loadedLevel)
 
-            // 关键修改：在创建新的Previewer之前，先清理旧的
+            // Clean up old Player
             if (previewerRef.current) {
-              console.log("Disposing old Previewer...")
-              previewerRef.current.dispose()
+              console.log("Disposing old Player...")
+              previewerRef.current.destroyPlayer()
               previewerRef.current = null
             }
 
-            // 创建新的Previewer
+            // Create new Player
             if (containerRef.current && fpsCounterRef.current && infoRef.current) {
-              previewerRef.current = new Previewer(
-                loadedLevel,
-                containerRef.current,
-                fpsCounterRef.current,
-                infoRef.current,
-                t,
-              )
+              const player = new Player(loadedLevel as ILevelData)
+              player.createPlayer(containerRef.current)
+              player.setRenderer(settings.renderer)
+              
+              player.setStatsCallback((stats) => {
+                if (fpsCounterRef.current) {
+                  fpsCounterRef.current.textContent = `FPS  ${stats.fps.toFixed(2)}`
+                }
+                if (infoRef.current) {
+                  const bpm = loadedLevel.settings?.bpm || 0
+                  infoRef.current.innerHTML = `
+                    <div class="space-y-1">
+                      <div>Time: ${(stats.time / 1000).toFixed(2)}s</div>
+                      <div>Tile: ${stats.tileIndex} / ${loadedLevel.tiles?.length || 0}</div>
+                      <div>BPM: ${bpm}</div>
+                    </div>
+                  `
+                }
+              })
+              
+              previewerRef.current = player
             }
             window.showNotification?.("success", t("editor.notifications.loadSuccess"))
           })
@@ -1099,6 +1120,31 @@ export default function EditorPage(): JSX.Element {
     },
     [t],
   )
+
+  // 音频加载处理
+  const handleAudioLoad = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>): void => {
+      const file = event.target.files?.[0]
+      if (!file) return
+
+      const url = URL.createObjectURL(file)
+      
+      if (previewerRef.current) {
+          previewerRef.current.loadMusic(url)
+          window.showNotification?.("success", "Audio loaded successfully")
+      } else {
+          window.showNotification?.("warning", "Please load a level first")
+      }
+    },
+    []
+  )
+
+  // 监听渲染器设置变化
+  useEffect(() => {
+    if (previewerRef.current && settings.renderer) {
+      previewerRef.current.setRenderer(settings.renderer)
+    }
+  }, [settings.renderer])
 
   // 键盘快捷键
   useEffect(() => {
@@ -1131,19 +1177,33 @@ export default function EditorPage(): JSX.Element {
           setAdofaiFile(loadedLevel)
 
           if (previewerRef.current) {
-            console.log("Disposing old Previewer...")
-            previewerRef.current.dispose()
+            console.log("Disposing old Player...")
+            previewerRef.current.destroyPlayer()
             previewerRef.current = null
           }
 
           if (containerRef.current && fpsCounterRef.current && infoRef.current) {
-            previewerRef.current = new Previewer(
-              loadedLevel,
-              containerRef.current,
-              fpsCounterRef.current,
-              infoRef.current,
-              t,
-            )
+            const player = new Player(loadedLevel as ILevelData)
+            player.createPlayer(containerRef.current)
+            player.setRenderer(settings.renderer)
+            
+            player.setStatsCallback((stats) => {
+              if (fpsCounterRef.current) {
+                fpsCounterRef.current.textContent = `FPS  ${stats.fps.toFixed(2)}`
+              }
+              if (infoRef.current) {
+                const bpm = loadedLevel.settings?.bpm || 0
+                infoRef.current.innerHTML = `
+                  <div class="space-y-1">
+                    <div>Time: ${(stats.time / 1000).toFixed(2)}s</div>
+                    <div>Tile: ${stats.tileIndex} / ${loadedLevel.tiles?.length || 0}</div>
+                    <div>BPM: ${bpm}</div>
+                  </div>
+                `
+              }
+            })
+            
+            previewerRef.current = player
           }
           window.showNotification?.("success", t("editor.notifications.loadSuccess"))
         })
@@ -1177,7 +1237,7 @@ export default function EditorPage(): JSX.Element {
   useEffect(() => {
     const handleBeforeUnload = (): void => {
       if (previewerRef.current) {
-        previewerRef.current.dispose()
+        previewerRef.current.destroyPlayer()
       }
     }
 
@@ -1185,7 +1245,7 @@ export default function EditorPage(): JSX.Element {
     return () => {
       window.removeEventListener("beforeunload", handleBeforeUnload)
       if (previewerRef.current) {
-        previewerRef.current.dispose()
+        previewerRef.current.destroyPlayer()
       }
     }
   }, [])
@@ -1233,6 +1293,7 @@ export default function EditorPage(): JSX.Element {
 
           <div className="flex items-center gap-2">
             <input ref={fileInputRef} type="file" accept=".adofai,.json" onChange={handleFileLoad} className="hidden" />
+            <input ref={audioInputRef} type="file" accept="audio/*" onChange={handleAudioLoad} className="hidden" />
             <Button
               variant="ghost"
               size="icon"
@@ -1247,6 +1308,20 @@ export default function EditorPage(): JSX.Element {
               title={isLoading ? t("common.loading") : t("editor.loadFile")}
             >
               <Upload className="w-4 h-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className={`${
+                isDark
+                  ? "text-slate-300 hover:text-white hover:bg-slate-700"
+                  : "text-slate-700 hover:text-slate-900 hover:bg-slate-100"
+              }`}
+              onClick={() => audioInputRef.current?.click()}
+              disabled={!adofaiFile}
+              title="Load Music"
+            >
+              <Music className="w-4 h-4" />
             </Button>
             <Button
               variant="ghost"

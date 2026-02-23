@@ -1,5 +1,5 @@
 {
-	"angleData": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+	"angleData": [0, 0, 90, 180, 90, 0, 0, 90, 180, 90, 0], 
 	"settings":
 	{
 		"version": 15 ,
@@ -85,6 +85,10 @@
 	},
 	"actions":
 	[
+		{ "floor": 1, "eventType": "SetSpeed", "speedType": "Multiplier", "beatsPerMinute": 100, "bpmMultiplier": 2, "angleOffset": 0},
+		{ "floor": 4, "eventType": "Twirl" },
+		{ "floor": 7, "eventType": "Twirl" },
+		{ "floor": 9, "eventType": "Twirl" }
 	],
 	"decorations":
 	[
