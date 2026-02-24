@@ -1,0 +1,10 @@
+*.user
+bin
+obj
+packages
+.vscode
+*.sh
+*.nupkg
+.idea
+.codebuddy
+SharpFAI-Player

@@ -139,6 +139,7 @@ export class Player implements IPlayer {
   private levelData: ILevelData;
   private planetRed: Planet | null = null;
   private planetBlue: Planet | null = null;
+  private currentPivotPosition: { x: number; y: number } = { x: 0, y: 0 };
 
   // Tile Management
   private tiles: Map<string, THREE.Mesh> = new Map();
@@ -157,6 +158,7 @@ export class Player implements IPlayer {
   
   // Camera settings
   private zoom: number = 1;
+  private zoomMultiplier: number = 1.0;
   private cameraPosition: THREE.Vector3 = new THREE.Vector3(0, 0, 0);
   
   // Interaction state
@@ -178,15 +180,19 @@ export class Player implements IPlayer {
   
   private tileStartTimes: number[] = [];
   private tileDurations: number[] = [];
+  private tileExtraRotations: number[] = [];
   private tileIsCW: boolean[] = [];
   private tileBPM: number[] = [];
   private tileEvents: Map<number, any[]> = new Map();
   private tileCameraEvents: Map<number, any[]> = new Map();
+  private cameraTimeline: { time: number; event: any }[] = [];
+  private lastCameraTimelineIndex: number = -1;
   private lastCameraEventTileIndex: number = -1;
 
   // Camera State
   private cameraMode = {
       relativeTo: 'Player',
+      anchorTileIndex: 0, // Used for 'Tile' relativeTo
       position: { x: 0, y: 0 }, // Offset or Global Pos
       zoom: 100,
       rotation: 0,
@@ -200,6 +206,14 @@ export class Player implements IPlayer {
       startSnapshot: {
           position: { x: 0, y: 0 },
           zoom: 100,
+          rotation: 0,
+          logicalPosition: { x: 0, y: 0 },
+          logicalZoom: 100,
+          logicalRotation: 0
+      },
+      targetSnapshot: {
+          position: { x: 0, y: 0 },
+          zoom: 100,
           rotation: 0
       },
       ease: 'Linear'
@@ -211,21 +225,24 @@ export class Player implements IPlayer {
     this.rendererType = rendererType;
     this.levelData = levelData;
     
+    // Initialize camera from settings
+    this.resetCameraState();
+    
     // Parse actions if available
     if (this.levelData.actions) {
       this.levelData.actions.forEach(action => {
         const floor = action.floor;
-        /*if (action.eventType === 'MoveCamera') {
+        if (action.eventType === 'MoveCamera') {
             if (!this.tileCameraEvents.has(floor)) {
                 this.tileCameraEvents.set(floor, []);
             }
             this.tileCameraEvents.get(floor)!.push(action);
-        } else {*/
+        } else {
             if (!this.tileEvents.has(floor)) {
                 this.tileEvents.set(floor, []);
             }
             this.tileEvents.get(floor)!.push(action);
-        /*}*/
+        }
       });
     }
 
@@ -237,6 +254,9 @@ export class Player implements IPlayer {
 
     // Calculate cumulative rotations
     this.calculateCumulativeRotations();
+    
+    // Build Camera Timeline
+    this.buildCameraTimeline();
     
     // Add lights
     const ambientLight = new THREE.AmbientLight(0x404040, 1.0);
@@ -306,6 +326,7 @@ export class Player implements IPlayer {
     this.cumulativeRotations = [0];
     this.tileStartTimes = [0];
     this.tileDurations = [];
+    this.tileExtraRotations = [];
     this.tileIsCW = [];
     this.tileBPM = [];
     
@@ -411,6 +432,7 @@ export class Player implements IPlayer {
         
         this.cumulativeRotations.push(totalRotation);
         this.tileDurations.push(duration);
+        this.tileExtraRotations.push(extraRotation);
         this.tileStartTimes.push(totalTime);
     }
     
@@ -435,6 +457,7 @@ export class Player implements IPlayer {
     // We can assume the last tile has the same settings as the previous one
     if (tiles.length > 0) {
         const lastIndex = tiles.length - 1;
+        let extraRotation = 0;
         if (this.tileEvents.has(lastIndex)) {
             const events = this.tileEvents.get(lastIndex)!;
             events.forEach(event => {
@@ -446,12 +469,16 @@ export class Player implements IPlayer {
                     } else {
                         currentBPM = event.beatsPerMinute;
                     }
+                } else if (event.eventType === 'Pause') {
+                    const duration = event.duration || 0;
+                    extraRotation += duration / 2.0;
                 }
             });
         }
 
         this.tileIsCW.push(isCW);
         this.tileBPM.push(currentBPM);
+        this.tileExtraRotations.push(extraRotation);
     }
     
     this.totalLevelRotation = totalRotation;
@@ -579,8 +606,8 @@ export class Player implements IPlayer {
     // But pixel movement needs to be converted to world units.
     
     // Calculate world units per pixel
-    const aspect = this.container!.clientWidth / this.container!.clientHeight;
-    const frustumHeight = this.camera.top - this.camera.bottom;
+    const zoom = this.camera.zoom || 1.0;
+    const frustumHeight = (this.camera.top - this.camera.bottom) / zoom;
     const unitsPerPixel = frustumHeight / this.container!.clientHeight;
 
     this.cameraPosition.x -= deltaX * unitsPerPixel;
@@ -603,13 +630,13 @@ export class Player implements IPlayer {
     
     const zoomSpeed = 0.1;
     if (event.deltaY < 0) {
-      this.zoom *= (1 + zoomSpeed);
+      this.zoomMultiplier *= (1 + zoomSpeed);
     } else {
-      this.zoom /= (1 + zoomSpeed);
+      this.zoomMultiplier /= (1 + zoomSpeed);
     }
     
-    // Clamp zoom
-    this.zoom = Math.max(0.1, Math.min(this.zoom, 10));
+    // Clamp zoom multiplier
+    this.zoomMultiplier = Math.max(0.1, Math.min(this.zoomMultiplier, 10));
     
     this.onWindowResize();
   }
@@ -624,7 +651,7 @@ export class Player implements IPlayer {
       const dx = event.touches[0].clientX - event.touches[1].clientX;
       const dy = event.touches[0].clientY - event.touches[1].clientY;
       this.initialPinchDistance = Math.sqrt(dx*dx + dy*dy);
-      this.initialZoom = this.zoom;
+      this.initialZoom = this.zoomMultiplier;
     }
   }
 
@@ -635,7 +662,8 @@ export class Player implements IPlayer {
       const deltaX = touch.clientX - this.previousMousePosition.x;
       const deltaY = touch.clientY - this.previousMousePosition.y;
       
-      const frustumHeight = this.camera.top - this.camera.bottom;
+      const zoom = this.camera.zoom || 1.0;
+      const frustumHeight = (this.camera.top - this.camera.bottom) / zoom;
       const unitsPerPixel = frustumHeight / this.container!.clientHeight;
       
       this.cameraPosition.x -= deltaX * unitsPerPixel;
@@ -654,8 +682,8 @@ export class Player implements IPlayer {
       
       if (this.initialPinchDistance > 0) {
         const scale = distance / this.initialPinchDistance;
-        this.zoom = this.initialZoom * scale;
-        this.zoom = Math.max(0.1, Math.min(this.zoom, 10));
+        this.zoomMultiplier = this.initialZoom * scale;
+        this.zoomMultiplier = Math.max(0.1, Math.min(this.zoomMultiplier, 10));
         this.onWindowResize();
       }
     }
@@ -712,35 +740,47 @@ export class Player implements IPlayer {
     if (!this.planetRed || !this.planetBlue) return;
 
     // Calculate current time
+    const settings = this.levelData.settings;
+    const initialBPM = settings.bpm || 100;
+    const initialSecPerBeat = 60 / initialBPM;
+    const countdownTicks = settings.countdownTicks || 4;
+    const countdownDuration = countdownTicks * initialSecPerBeat;
+
     if (this.music.isPlaying) {
         const musicTime = this.music.position * 1000;
         
         // Sync logic: Only sync if music has actually started (position > 0)
         // This prevents "twitching" (0 -> 50 -> 0) during audio buffering/startup
         if (musicTime > 0) {
-            const expectedTime = performance.now() - this.startTime;
+            // Expected elapsedTime when music is at musicTime:
+            // elapsedTime = musicTime + countdownDuration * 1000
+            const expectedElapsedTime = musicTime + countdownDuration * 1000;
+            const actualElapsedTime = performance.now() - this.startTime;
+
             // If drift is significant (> 50ms), hard sync
-            if (Math.abs(musicTime - expectedTime) > 50) {
-                 this.startTime = performance.now() - musicTime;
-                 this.elapsedTime = musicTime;
+            if (Math.abs(expectedElapsedTime - actualElapsedTime) > 50) {
+                 this.startTime = performance.now() - expectedElapsedTime;
+                 this.elapsedTime = expectedElapsedTime;
             } else {
-                 this.elapsedTime = expectedTime;
+                 this.elapsedTime = actualElapsedTime;
             }
         } else {
             // Music is theoretically playing but position is 0 (loading/buffering)
-            // Hold visual time at 0 to avoid jump
-            this.startTime = performance.now();
-            this.elapsedTime = 0;
+            // Hold visual time at start of music playback
+            const musicStartTime = countdownDuration * 1000;
+            this.startTime = performance.now() - musicStartTime;
+            this.elapsedTime = musicStartTime;
         }
     } else {
         // If not playing music (or fallback), use standard timer
-        // But if we are in "Play" mode and waiting for music to start?
-        // isPlaying flag is true in startPlay().
-        // So we fall here only if music.isPlaying is false (e.g. ended or failed).
-        // If we are just paused, we don't update elapsedTime.
         if (this.isPlaying && !this.isPaused) {
              const now = performance.now();
              this.elapsedTime = now - this.startTime;
+
+             // Auto-start music after countdown
+             if (this.music.hasAudio && !this.music.isPaused && this.elapsedTime >= countdownDuration * 1000) {
+                 this.music.play();
+             }
         }
     }
     
@@ -770,21 +810,152 @@ export class Player implements IPlayer {
     this.elapsedTime = 0;
     this.currentTileIndex = 0;
     
-    // Play Music
-    this.music.play();
+    // Music is started automatically after countdown in updatePlayer
     
     this.createPlanets();
     
     // Reset camera state
-    this.lastCameraEventTileIndex = -1;
-    this.cameraMode = {
-        relativeTo: 'Player',
-        position: { x: 0, y: 0 },
-        zoom: 100,
-        rotation: 0,
-        angleOffset: 0
-    };
+    this.lastCameraTimelineIndex = -1;
+    this.resetCameraState();
     this.cameraTransition.active = false;
+  }
+
+  private buildCameraTimeline(): void {
+      this.cameraTimeline = [];
+      const entries: { time: number; event: any }[] = [];
+      
+      this.tileCameraEvents.forEach((events, floor) => {
+          const startTime = this.tileStartTimes[floor] || 0; // seconds
+          const bpm = this.tileBPM[floor] || 100;
+          const secPerBeat = 60 / bpm;
+          
+          events.forEach(event => {
+              // Ensure floor is attached to the event for relativeTo: Tile
+              const eventWithFloor = { ...event, floor };
+              
+              // angleOffset is in degrees. 180 degrees = 1 beat.
+              const angleOffset = event.angleOffset || 0;
+              const timeOffset = (angleOffset / 180) * secPerBeat;
+              const eventTime = startTime + timeOffset;
+              
+              entries.push({ time: eventTime, event: eventWithFloor });
+          });
+      });
+      
+      // Sort by time
+      entries.sort((a, b) => a.time - b.time);
+      this.cameraTimeline = entries;
+  }
+
+  private resetCameraState(): void {
+    const settings = this.levelData.settings;
+    if (settings) {
+        this.cameraMode.relativeTo = settings.relativeTo || 'Player';
+        this.cameraMode.anchorTileIndex = 0;
+        this.cameraMode.position = settings.position ? { x: settings.position[0], y: settings.position[1] } : { x: 0, y: 0 };
+        this.cameraMode.rotation = settings.rotation !== undefined ? settings.rotation : 0;
+        this.cameraMode.zoom = settings.zoom !== undefined ? settings.zoom : 100;
+        this.zoom = this.cameraMode.zoom / 100;
+        this.cameraMode.angleOffset = settings.angleOffset !== undefined ? settings.angleOffset : 0;
+    } else {
+        this.cameraMode = {
+            relativeTo: 'Player',
+            anchorTileIndex: 0,
+            position: { x: 0, y: 0 },
+            zoom: 100,
+            rotation: 0,
+            angleOffset: 0
+        };
+        this.zoom = 1;
+    }
+  }
+
+  private processCameraEvent(event: any, floorIndex: number): void {
+      // If there's an active transition, finish it instantly (Logical transition only)
+      if (this.cameraTransition.active) {
+           this.cameraTransition.active = false;
+      }
+
+      const duration = (event.duration !== undefined) ? event.duration : 0;
+      const relativeTo = (event.relativeTo !== undefined) ? event.relativeTo : 'Player';
+      
+      const startLogicalPos = { ...this.cameraMode.position };
+      const startLogicalZoom = this.cameraMode.zoom;
+      const startLogicalRotation = this.cameraMode.rotation;
+
+      let nextRelativeTo = this.cameraMode.relativeTo;
+      if (typeof relativeTo === 'string') {
+          nextRelativeTo = relativeTo;
+      } else if (typeof relativeTo === 'number') {
+          nextRelativeTo = ['Player', 'Tile', 'Global', 'LastPosition', 'LastPositionNoRotation'][relativeTo] || 'Player';
+      }
+
+      // 1. Update RelativeTo & Anchor
+      if (nextRelativeTo === 'LastPosition' || nextRelativeTo === 'LastPositionNoRotation') {
+          // Keep current relativeTo and anchorTileIndex
+      } else {
+          this.cameraMode.relativeTo = nextRelativeTo;
+          if (nextRelativeTo === 'Tile') {
+              this.cameraMode.anchorTileIndex = floorIndex;
+          } else if (nextRelativeTo === 'Global' || nextRelativeTo === 'Player') {
+              this.cameraMode.anchorTileIndex = 0; // Default or ignored
+          }
+      }
+
+      // 2. Update Position
+      if (event.position !== undefined && event.position !== null) {
+          const px = event.position[0];
+          const py = event.position[1];
+          
+          if (nextRelativeTo === 'LastPosition' || nextRelativeTo === 'LastPositionNoRotation') {
+              if (px !== null && px !== undefined) this.cameraMode.position.x += px;
+              if (py !== null && py !== undefined) this.cameraMode.position.y += py;
+          } else {
+              if (px !== null && px !== undefined) this.cameraMode.position.x = px;
+              if (py !== null && py !== undefined) this.cameraMode.position.y = py;
+          }
+      }
+
+      // 3. Update Rotation
+      if (event.rotation !== undefined && event.rotation !== null) {
+          if (nextRelativeTo === 'LastPosition') {
+              this.cameraMode.rotation += event.rotation;
+          } else {
+              this.cameraMode.rotation = event.rotation;
+          }
+      }
+
+      // 4. Update Zoom (Always absolute)
+      if (event.zoom !== undefined && event.zoom !== null) {
+          this.cameraMode.zoom = event.zoom;
+      }
+
+      // 5. Angle Offset
+      if (event.angleOffset !== undefined && event.angleOffset !== null) {
+          this.cameraMode.angleOffset = event.angleOffset;
+      }
+
+      // Setup Transition
+      const currentBPM = (this.tileBPM && this.tileBPM[this.currentTileIndex]) || 100;
+      const durationSeconds = duration * (60 / currentBPM);
+
+      if (durationSeconds <= 0) {
+          this.cameraTransition.active = false;
+      } else {
+          this.cameraTransition.active = true;
+          this.cameraTransition.startTime = this.elapsedTime / 1000;
+          this.cameraTransition.duration = durationSeconds;
+          this.cameraTransition.ease = event.ease || 'Linear';
+          
+          this.cameraTransition.startSnapshot = {
+              position: { x: this.cameraPosition.x, y: this.cameraPosition.y },
+              zoom: this.zoom,
+              rotation: this.camera.rotation.z * (180 / Math.PI),
+              logicalPosition: startLogicalPos,
+              logicalZoom: startLogicalZoom,
+              logicalRotation: startLogicalRotation
+          };
+      }
   }
 
   public stopPlay(): void {
@@ -793,7 +964,9 @@ export class Player implements IPlayer {
     this.removePlanets();
     
     // Stop Music
-    this.music.stop();
+    if (this.music && (this.music as any).hasAudio ? this.music.hasAudio : false) {
+      this.music.stop();
+    }
     
     // Reset camera to start or keep where it is? Usually reset for preview.
     // this.cameraPosition.set(0, 0, 0);
@@ -804,7 +977,9 @@ export class Player implements IPlayer {
     if (!this.isPlaying || this.isPaused) return;
     this.isPaused = true;
     this.pauseTime = performance.now();
-    this.music.pause();
+    if (this.music && (this.music as any).hasAudio ? this.music.hasAudio : false) {
+      this.music.pause();
+    }
   }
 
   public resumePlay(): void {
@@ -813,7 +988,9 @@ export class Player implements IPlayer {
     // Adjust start time to account for pause duration
     const pauseDuration = performance.now() - this.pauseTime;
     this.startTime += pauseDuration;
-    this.music.resume();
+    if (this.music && (this.music as any).hasAudio ? this.music.hasAudio : false) {
+      this.music.resume();
+    }
   }
 
   public resetPlayer(): void {
@@ -846,12 +1023,16 @@ export class Player implements IPlayer {
     const height = this.container.clientHeight;
     
     const aspect = width / height;
-    const frustumSize = 20 / this.zoom; // Adjust based on zoom (smaller frustum = zoom in)
+    // Use a fixed base frustum size, zoom is handled by camera.zoom
+    const baseFrustumSize = 20;
     
-    this.camera.left = -frustumSize * aspect / 2;
-    this.camera.right = frustumSize * aspect / 2;
-    this.camera.top = frustumSize / 2;
-    this.camera.bottom = -frustumSize / 2;
+    this.camera.left = -baseFrustumSize * aspect / 2;
+    this.camera.right = baseFrustumSize * aspect / 2;
+    this.camera.top = baseFrustumSize / 2;
+    this.camera.bottom = -baseFrustumSize / 2;
+    
+    // Update actual camera zoom
+    this.camera.zoom = this.zoom * this.zoomMultiplier;
     
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
@@ -860,8 +1041,9 @@ export class Player implements IPlayer {
   }
 
   private createPlanets(): void {
-    this.planetRed = new Planet(0xff0000);
-    this.planetBlue = new Planet(0x0000ff);
+    const showTrail = false; // Temporarily disabled
+    this.planetRed = new Planet(0xff0000, undefined, showTrail);
+    this.planetBlue = new Planet(0x0000ff, undefined, showTrail);
     
     this.planetRed.render(this.scene);
     this.planetBlue.render(this.scene);
@@ -875,20 +1057,20 @@ export class Player implements IPlayer {
         // Adjust coordinates as per ADOFAI grid logic
         
         // Use standard t0, t1 positions
-        this.planetRed.position.set(t0.position[0], t0.position[1], 0);
-        this.planetBlue.position.set(t1.position[0], t1.position[1], 0);
+        this.planetRed.position.set(t0.position[0], t0.position[1], 0.1);
+        this.planetBlue.position.set(t1.position[0], t1.position[1], 0.1);
       }
     }
   }
 
   private removePlanets(): void {
     if (this.planetRed) {
-      this.scene.remove(this.planetRed.mesh);
+      this.planetRed.removeFromScene(this.scene);
       this.planetRed.dispose();
       this.planetRed = null;
     }
     if (this.planetBlue) {
-      this.scene.remove(this.planetBlue.mesh);
+      this.planetBlue.removeFromScene(this.scene);
       this.planetBlue.dispose();
       this.planetBlue = null;
     }
@@ -925,16 +1107,14 @@ export class Player implements IPlayer {
   }
 
   private updateVisibleTiles(): void {
-    if (!this.scene || !this.levelData.tiles) return;
+    if (!this.scene || !this.levelData.tiles || !this.camera) return;
 
-    const containerSize = this.getContainerSize();
-    const aspect = containerSize.width / containerSize.height;
-    const frustumSize = 20 / this.zoom;
-
-    const left = this.cameraPosition.x - (frustumSize * aspect) / 2;
-    const right = this.cameraPosition.x + (frustumSize * aspect) / 2;
-    const bottom = this.cameraPosition.y - frustumSize / 2;
-    const top = this.cameraPosition.y + frustumSize / 2;
+    // Use camera's actual frustum and zoom to determine visible area
+    const zoom = this.camera.zoom || 1.0;
+    const left = this.cameraPosition.x + this.camera.left / zoom;
+    const right = this.cameraPosition.x + this.camera.right / zoom;
+    const bottom = this.cameraPosition.y + this.camera.bottom / zoom;
+    const top = this.cameraPosition.y + this.camera.top / zoom;
 
     // Clear current visible tiles
     this.visibleTiles.forEach((tileId) => {
@@ -1110,23 +1290,24 @@ export class Player implements IPlayer {
   private updatePlanetsPosition(): void {
     if (!this.planetRed || !this.planetBlue) return;
     
+    const currentTimeInSeconds = this.elapsedTime / 1000;
     const settings = this.levelData.settings;
     const countdownTicks = settings.countdownTicks || 4;
     
     // Time in seconds
     // Only use offset if audio is present
     const offset = this.music.hasAudio ? (this.levelData.settings.offset || 0) : 0;
-    const timeInSeconds = (this.elapsedTime - offset) / 1000;
     
     // Countdown duration
-    // Countdown uses the initial BPM
     const initialBPM = settings.bpm || 100;
     const initialSecPerBeat = 60 / initialBPM;
     const countdownDuration = countdownTicks * initialSecPerBeat;
-    
+
     // Logical time relative to start of first tile
     // If offset is correctly set, timeInSeconds=0 means we hit the first tile.
-    const timeInLevel = timeInSeconds;
+    // We subtract countdownDuration so that at elapsedTime=0, we are at -countdownDuration.
+    // At elapsedTime = countdownDuration*1000 + offset, timeInLevel is 0.
+    const timeInLevel = (this.elapsedTime / 1000) - countdownDuration - (offset / 1000);
     
     if (timeInLevel < 0) {
         // Countdown Phase (Approaching Tile 1)
@@ -1202,6 +1383,8 @@ export class Player implements IPlayer {
              const movingPlanet = isRedPivot ? this.planetBlue : this.planetRed;
              
              const pivotPos = lastTile.position;
+             this.currentPivotPosition.x = pivotPos[0];
+             this.currentPivotPosition.y = pivotPos[1];
              pivotPlanet.position.set(pivotPos[0], pivotPos[1], 0);
              
              let startAngle = 0;
@@ -1276,12 +1459,13 @@ export class Player implements IPlayer {
              movingPlanet.position.set(
                  pivotPos[0] + Math.cos(currentAngle) * dist,
                  pivotPos[1] + Math.sin(currentAngle) * dist,
-                 0
+                 0.1
              );
              
-             // Ensure meshes are updated
-             pivotPlanet.update(0);
-             movingPlanet.update(0);
+             // Ensure meshes are updated with currentTime
+             pivotPlanet.position.z = 0.1;
+             pivotPlanet.update(0, currentTimeInSeconds);
+             movingPlanet.update(0, currentTimeInSeconds);
         }
         return;
     }
@@ -1295,14 +1479,16 @@ export class Player implements IPlayer {
         const pivotPlanet = isRedPivot ? this.planetRed : this.planetBlue;
         const movingPlanet = isRedPivot ? this.planetBlue : this.planetRed;
         
-        pivotPlanet.position.set(pivot.position[0], pivot.position[1], 0);
-        
+        const pivotPos = pivot.position;
+        this.currentPivotPosition.x = pivotPos[0];
+        this.currentPivotPosition.y = pivotPos[1];
+        pivotPlanet.position.set(pivotPos[0], pivotPos[1], 0.1);
+
         const startTime = this.tileStartTimes[tileIndex];
         const duration = this.tileDurations[tileIndex];
         // Prevent division by zero if duration is 0 (should not happen usually)
         const progress = duration > 0.0001 ? (timeInLevel - startTime) / duration : 1;
         
-        const pivotPos = pivot.position;
         const nextPos = next.position;
         
         const dx = nextPos[0] - pivotPos[0];
@@ -1319,6 +1505,7 @@ export class Player implements IPlayer {
         
         // Calculate Angle based on direction
         const isCW = this.tileIsCW[tileIndex];
+        const extraRotation = this.tileExtraRotations[tileIndex] || 0;
         let totalAngle = 0;
         
         // Midspin check
@@ -1338,6 +1525,13 @@ export class Player implements IPlayer {
              totalAngle = diff;
         }
 
+        // Add extra rotation from Pause
+        if (isCW) {
+            totalAngle -= extraRotation * 2 * Math.PI;
+        } else {
+            totalAngle += extraRotation * 2 * Math.PI;
+        }
+
         const currentAngle = startAngle + totalAngle * progress;
         
         // Interpolate radius
@@ -1355,161 +1549,116 @@ export class Player implements IPlayer {
         movingPlanet.position.set(
             pivotPos[0] + Math.cos(currentAngle) * currentDist,
             pivotPos[1] + Math.sin(currentAngle) * currentDist,
-            0
+            0.1
         );
     }
     
     // Sync meshes
-    this.planetRed.update(0);
-    this.planetBlue.update(0);
+    this.planetRed.update(0, currentTimeInSeconds);
+    this.planetBlue.update(0, currentTimeInSeconds);
   }
   
   private updateCameraFollow(delta: number): void {
       if (!this.planetRed || !this.planetBlue) return;
 
-      // 1. Process new camera events
-      if (this.currentTileIndex > this.lastCameraEventTileIndex) {
-          // Process events for the current tile
-          const events = this.tileCameraEvents.get(this.currentTileIndex);
-          if (events && events.length > 0) {
-               events.forEach(event => {
-                   const duration = (event.duration !== undefined) ? event.duration : 0;
-                   const relativeTo = (event.relativeTo !== undefined) ? event.relativeTo : 'Player';
-                   
-                   // Update Camera Mode (Target)
-                   // Handle enum string or int if necessary, though usually string from JSON
-                   if (typeof relativeTo === 'string') {
-                       this.cameraMode.relativeTo = relativeTo;
-                   } else if (typeof relativeTo === 'number') {
-                       this.cameraMode.relativeTo = ['Player', 'Tile', 'Global', 'LastPosition', 'LastPositionNoRotation'][relativeTo] || 'Player';
-                   }
-                        
-                   if (event.position) {
-                       // Ensure position is treated as offset or absolute based on relativeTo
-                       this.cameraMode.position = { x: event.position[0], y: event.position[1] };
-                   }
-                   if (event.zoom !== undefined) this.cameraMode.zoom = event.zoom;
-                   if (event.rotation !== undefined) this.cameraMode.rotation = event.rotation;
-                   if (event.angleOffset !== undefined) this.cameraMode.angleOffset = event.angleOffset;
-                   
-                   // Setup Transition
-                   // Duration in beats. Convert to seconds.
-                   const currentBPM = (this.tileBPM && this.tileBPM[this.currentTileIndex]) || 100;
-                   const durationSeconds = duration * (60 / currentBPM);
-                   
-                   this.cameraTransition.active = true;
-                   this.cameraTransition.startTime = this.elapsedTime / 1000; // seconds
-                   this.cameraTransition.duration = durationSeconds;
-                   this.cameraTransition.ease = event.ease || 'Linear';
-                   
-                   // Snapshot current state (World)
-                   this.cameraTransition.startSnapshot = {
-                       position: { x: this.cameraPosition.x, y: this.cameraPosition.y },
-                       zoom: this.zoom,
-                       rotation: this.camera.rotation.z * (180 / Math.PI)
-                   };
-               });
-          }
-          this.lastCameraEventTileIndex = this.currentTileIndex;
-      }
+      const settings = this.levelData.settings;
+      const initialBPM = settings.bpm || 100;
+      const initialSecPerBeat = 60 / initialBPM;
+      const countdownTicks = settings.countdownTicks || 4;
+      const countdownDuration = countdownTicks * initialSecPerBeat;
+      const offset = this.music.hasAudio ? (this.levelData.settings.offset || 0) : 0;
       
-      // 2. Calculate Target State (World Coordinates)
-      let targetX = 0;
-      let targetY = 0;
-      
-      // Calculate Player Position (Midpoint)
-      const playerX = (this.planetRed.position.x + this.planetBlue.position.x) / 2;
-      const playerY = (this.planetRed.position.y + this.planetBlue.position.y) / 2;
-      
-      if (this.cameraMode.relativeTo === 'Player') {
-          targetX = playerX + this.cameraMode.position.x;
-          targetY = playerY + this.cameraMode.position.y;
-      } else if (this.cameraMode.relativeTo === 'Global') {
-          targetX = this.cameraMode.position.x;
-          targetY = this.cameraMode.position.y;
-      } else if (this.cameraMode.relativeTo === 'Tile') {
-          const tile = this.levelData.tiles[this.currentTileIndex];
-          if (tile) {
-              targetX = tile.position[0] + this.cameraMode.position.x;
-              targetY = tile.position[1] + this.cameraMode.position.y;
-          } else {
-              targetX = playerX;
-              targetY = playerY;
-          }
-      } else {
-          // Fallback
-          targetX = playerX;
-          targetY = playerY;
+      const currentTimeInSeconds = this.elapsedTime / 1000;
+      const timeInLevel = currentTimeInSeconds - countdownDuration - (offset / 1000);
+
+      // 1. Process new camera events (using high-performance Timeline)
+      // We check against timeInLevel because cameraTimeline is built using tileStartTimes (logic time)
+      if (this.lastCameraTimelineIndex >= 0 && 
+          this.cameraTimeline[this.lastCameraTimelineIndex] && 
+          timeInLevel < this.cameraTimeline[this.lastCameraTimelineIndex].time) {
+          this.resetCameraState();
+          this.lastCameraTimelineIndex = -1;
       }
 
-      const targetZoom = this.cameraMode.zoom / 100; // Convert 100% to 1.0
-      const targetRotation = this.cameraMode.rotation; // Degrees
+      while (this.lastCameraTimelineIndex + 1 < this.cameraTimeline.length && 
+             this.cameraTimeline[this.lastCameraTimelineIndex + 1].time <= timeInLevel) {
+          this.lastCameraTimelineIndex++;
+          const entry = this.cameraTimeline[this.lastCameraTimelineIndex];
+          this.processCameraEvent(entry.event, entry.event.floor || 0);
+      }
       
-      // 3. Apply Transition or Smoothing
-      let finalX = targetX;
-      let finalY = targetY;
-      let finalZoom = targetZoom;
-      let finalRotation = targetRotation;
-      
-      const timeInSeconds = this.elapsedTime / 1000;
-      
+      // 2. Interpolate Logical Camera State (if transition active)
+      let logicalPos = { ...this.cameraMode.position };
+      let logicalZoom = this.cameraMode.zoom;
+      let logicalRotation = this.cameraMode.rotation;
+
       if (this.cameraTransition.active) {
-          let t = 0;
-          if (this.cameraTransition.duration > 0.0001) {
-              t = (timeInSeconds - this.cameraTransition.startTime) / this.cameraTransition.duration;
-          } else {
-              t = 1;
-          }
-          
+          // Transitions are also relative to logic time?
+          // The startTime stored in transition is based on currentTimeInSeconds.
+          let t = (currentTimeInSeconds - this.cameraTransition.startTime) / this.cameraTransition.duration;
           if (t >= 1) {
               this.cameraTransition.active = false;
-              // Settle at target
           } else {
-              // Interpolate
               const easeFunc = EasingFunctions[this.cameraTransition.ease] || EasingFunctions.Linear;
               const progress = easeFunc(t);
               
               const start = this.cameraTransition.startSnapshot;
               
-              finalX = start.position.x + (targetX - start.position.x) * progress;
-              finalY = start.position.y + (targetY - start.position.y) * progress;
-              finalZoom = start.zoom + (targetZoom - start.zoom) * progress;
-              finalRotation = start.rotation + (targetRotation - start.rotation) * progress;
-          }
-      } else {
-          // Default Smoothing behavior if following Player
-          if (this.cameraMode.relativeTo === 'Player') {
-               const currentBPM = (this.tileBPM && this.tileBPM[this.currentTileIndex]) || 100;
-               const twoBeatsDuration = 120 / currentBPM;
-               
-               // Use exponential smoothing
-               // delta is in seconds
-               const smoothT = 1.0 - Math.pow(0.001, delta / twoBeatsDuration);
-               
-               this.cameraPosition.x += (targetX - this.cameraPosition.x) * smoothT;
-               this.cameraPosition.y += (targetY - this.cameraPosition.y) * smoothT;
-               
-               finalX = this.cameraPosition.x;
-               finalY = this.cameraPosition.y;
-          } else {
-               // For Global/Tile, snap directly (or maintain last position if we wanted smoothing there too)
-               this.cameraPosition.x = finalX;
-               this.cameraPosition.y = finalY;
+              logicalPos.x = start.logicalPosition.x + (this.cameraMode.position.x - start.logicalPosition.x) * progress;
+              logicalPos.y = start.logicalPosition.y + (this.cameraMode.position.y - start.logicalPosition.y) * progress;
+              logicalZoom = start.logicalZoom + (this.cameraMode.zoom - start.logicalZoom) * progress;
+              logicalRotation = start.logicalRotation + (this.cameraMode.rotation - start.logicalRotation) * progress;
           }
       }
+
+      // 3. Calculate World Target Position
+      let targetX = 0;
+      let targetY = 0;
       
-      // Update Three.js Camera
-      this.camera.position.x = finalX;
-      this.camera.position.y = finalY;
+      if (this.cameraMode.relativeTo === 'Player') {
+          targetX = this.currentPivotPosition.x + logicalPos.x;
+          targetY = this.currentPivotPosition.y + logicalPos.y;
+      } else if (this.cameraMode.relativeTo === 'Global') {
+          const tile0 = this.levelData.tiles[0];
+          const originX = tile0 ? tile0.position[0] : 0;
+          const originY = tile0 ? tile0.position[1] : 0;
+          targetX = originX + logicalPos.x;
+          targetY = originY + logicalPos.y;
+      } else if (this.cameraMode.relativeTo === 'Tile') {
+          const tile = this.levelData.tiles[this.cameraMode.anchorTileIndex];
+          if (tile) {
+              targetX = tile.position[0] + logicalPos.x;
+              targetY = tile.position[1] + logicalPos.y;
+          } else {
+              targetX = this.currentPivotPosition.x + logicalPos.x;
+              targetY = this.currentPivotPosition.y + logicalPos.y;
+          }
+      } else {
+          targetX = this.currentPivotPosition.x + logicalPos.x;
+          targetY = this.currentPivotPosition.y + logicalPos.y;
+      }
+
+      // 4. Apply Smoothing Index Formula (BPM dependent)
+      const currentBPM = (this.tileBPM && this.tileBPM[this.currentTileIndex]) || 100;
+      // Index gets smaller as BPM increases (faster follow)
+      const smoothingIndex = 15 * Math.pow(100 / Math.max(1, currentBPM), 0.15);
       
-      // Update Zoom
-      this.camera.zoom = finalZoom;
-      this.zoom = finalZoom;
+      // Frame-rate independent step
+      const step = 1.0 - Math.pow(1.0 - 1.0 / smoothingIndex, delta * 60);
+      
+      this.cameraPosition.x += (targetX - this.cameraPosition.x) * step;
+      this.cameraPosition.y += (targetY - this.cameraPosition.y) * step;
+
+      // 5. Update Actual Three.js Camera
+      this.camera.position.x = this.cameraPosition.x;
+      this.camera.position.y = this.cameraPosition.y;
+      
+      this.zoom = logicalZoom / 100;
+      this.camera.zoom = this.zoom * this.zoomMultiplier;
       this.camera.updateProjectionMatrix();
       
-      // Update Rotation
-      this.camera.rotation.z = finalRotation * (Math.PI / 180);
-      
+      this.camera.rotation.z = logicalRotation * (Math.PI / 180);
+
       this.updateVisibleTiles();
   }
 
